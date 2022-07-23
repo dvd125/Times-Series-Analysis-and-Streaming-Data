@@ -1,0 +1,622 @@
+---
+title: "Times series analysis"
+author: David Doci 799647
+date: x/06/2021
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '5'
+  beamer_presentation:
+    colortheme: lily
+    fig_caption: no
+    fig_height: 6
+    fig_width: 7
+    fonttheme: structurebold
+    theme: Hannover
+    toc: yes
+  pdf_document:
+    toc: yes
+    toc_depth: 5
+  prettydoc::html_pretty:
+    df_print: paged
+    highlight: vignette
+    theme: architect
+    toc: yes
+    toc_depth: 5
+  slidy_presentation:
+    highlight: default
+  ioslides_presentation:
+    css:
+    - css/fonts.css
+    - css/custom.css
+    - css/title-slide.css
+    - css/slide-background.css
+    includes:
+      before_body: html/title.html
+    toc: yes
+    transition: default
+    widescreen: yes
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Librerie, include=FALSE}
+library(TSA)
+library(xts)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(sqldf)
+library(tidyverse)
+library(stringr)
+library(forecast)
+library(urca)
+library(zoo)
+library(KFAS)
+library(keras)
+library(tensorflow)
+library(ggpubr)
+library(DMwR)
+use_condaenv("r-tensorflow")
+library(caret)
+set.seed(2021)
+```
+
+```{r Import dati, include=FALSE}
+ABSOLUTE_PATH <- "C:\\Users\\ddoci\\OneDrive\\Desktop\\SD_TS"
+data <- read.csv(paste0(ABSOLUTE_PATH,"\\TrainingSet.csv"),sep=";")
+```
+# Introduzione Progetto
+Il progetto consiste nell'analizzare una serie storica oraria, compresa in un arco temporale di 730 giorni (dal 1° Settembre 2018 fino al 31 Agosto 2020). L'obiettivo principale sarà quello di costruire diversi modelli statistici in grado di prevedere nella maniera più accurata possibile i valori orari per i 61 giorni successivi (Settembre - Ottobre 2020). Il seguente R markdown conterrà il preprocessing e lo sviluppo di due modelli statistici: il modello ARIMA (Auto Regressive Integrated Moving Average) ed il modello UCM (Unobserved Components Models).
+Lo sviluppo del terzo modello facente parte della famiglia dei RNN (Recurrent Neural Network) verrà sviluppato in codice python.
+Come metro di paragone per poter confrontare i modelli verrà utilizzata la metrica MAE (Mean Absolute Error), sia sul training set che sul validation set e successivamente verranno messe a confronto le predizione dei modelli con i reali valori per poter così selezionare il miglior modello testato.####### Da revisionare
+
+
+
+```{r Analisi esplorativa}
+#sum(is.na(data))
+data %>% group_by(Ora)%>% count(Ora)
+Representation <- aggregate(Ora ~ DATA, data=data,FUN=function(x){length(unique(x))})
+
+```
+Dopo una rapida ricerca di valori nulli e/o mancanti (risultata negativa), si è passato al controllo dei valori orario nell'arco dei 730 giorni presenti nel dataset. Tale ricerca ha portato all'evidenza di due valori mancanti dell'Ora 3, tale mancanza è da attribuire probabilmente al cambio dell'ora legale. 
+
+
+```{r Ricerca ore legali, echo=FALSE}
+legal_hours <- sqldf('SELECT DATA
+              FROM Representation
+              WHERE Ora !=24')
+legal_hours
+
+```
+
+L'ipotesi dell'ora legale è risultata corretta, poichè dopo una rapida ricerca si è potuto constatare che le date dove era presente l'anomalia erano effetivamente le date dove è avenuto il cambio dell'ora.
+Il passo successivo è stato quello di aggiungere manualmente l'ora mancante con il valore precedente.
+
+```{r Aggiunta ore mancanti}
+legal_hours <- sqldf( "SELECT DATA, Ora, VALORE 
+              FROM data 
+              WHERE DATA == '2019-03-31' OR DATA == '2020-03-29'")
+
+legal_hours_2019 <- sqldf ("SELECT VALORE
+                  FROM data
+                  WHERE DATA =='2019-03-31'AND Ora==2 ")
+legal_hours_2020 <- sqldf ("SELECT VALORE
+                  FROM data
+                  WHERE DATA =='2020-03-29'AND Ora==2 ")
+#legal_hours_2019
+#legal_hours_2020
+
+new_values <- data.frame('2019-03-31', 3, 3039997)      
+names(new_values) <- c("DATA", "Ora", "VALORE") 
+data <- rbind(data[1:5066,],new_values,data[-(1:5066),])
+
+new_values <- data.frame('2020-03-29', 3, 2329514)      
+names(new_values) <- c("DATA", "Ora", "VALORE") 
+data <- rbind(data[1:13802,],new_values,data[-(1:13802),])
+rownames(data) <- 1:nrow(data)
+```
+Successivamente si è convertita la colonna "DATA" in formato datetime e si è passati alla conversione del dataframe in formato xts, per poter così visualizzare la serie storica. (discutere di stazionarità)
+```{r Pre-processing}
+data <- data %>%
+  dplyr::mutate(data = paste(DATA, Ora, sep = ":"),
+                data = lubridate::parse_date_time(data, 'Y:m-:d:H'),
+                data = format(strptime(data, "%Y-%m-%d %H:%M"),'%Y-%m-%d %H:%M'))
+y_ <- xts(data$VALORE, as.Date(as.character(data$data), format = "%Y-%m-%d %H:%M"))
+
+autoplot(y_, xlab="Data", ylab="Valore", main="Serie Storica")##### DA MIGLIORARE
+```
+##Analisi della stagionalità
+
+
+Per poter verificare la presenza o meno di stagionalità nella nostra Time Series si è deciso di costruire diverse serie temporali con frequenze differenti (giornaliera, settimanale, mensile ed infide annuale)
+Si costruiscono le Time Series giornaliere, settimanali, mensili ed annuali per individuare per ognuna di esse una possibile stagionalità. Gli ultimi due oggetti sono stati aggregati in termini medi i valori. Dal grafico è possibile osservare una stagionalità giornaliera, in quanto  i valori aumentano nelle ore del giorno lavorativo e diminuiscono nella pausa pranzo, a fine orario lavorativo e di notte. Il settimanale conferma quanto detto precedentemente; inoltre, si osserva un leggero trend crescente da inizio a fine settimana. Non è presente stagionalità mensile, in quanto non esiste un pattern uguale per tutti i mesi. Infine, è possibile notare una lieve stagionalità annuale.
+
+
+```{r}
+y_daily <- y_ %>% ts(frequency=24)
+y_weekly <- y_ %>% ts(frequency = 168)
+ag_mean_values <- aggregate(VALORE ~ DATA, data, mean)
+
+ggseasonplot(y_daily,year.labels = TRUE,                        
+           year.labels.left = FALSE,
+           main = "Stagionalità Giornaliera",
+           ylab = "Valore",            
+           xlab = "Orario del Giorno"
+           , col=rainbow(24))
+```
+```{r Stagionalità settimanale}
+ggseasonplot(y_weekly,                      
+             year.labels = TRUE,                        
+             year.labels.left = FALSE, 
+             main = "Stagionalità settimanale",
+             ylab = "Valore",              
+             xlab = "Giorni della Settimana")
+```
+```{r Stagionalità mensile}
+ggseasonplot(ts(ag[,"VALORE"], frequency=30),                     
+             year.labels = TRUE,                        
+             year.labels.left = FALSE, 
+             main = "Stagionalità Mensile",
+             ylab = "Valore",              
+             xlab = "Giorni presenti in un Mese")
+```
+```{r Stagionalità Annua}
+ggseasonplot(ts(ag[,"VALORE"], frequency=730/2),                      
+             year.labels = TRUE,                        
+             year.labels.left = FALSE,                
+             main = "Stagionalità Annuale",              
+             ylab = "Valore",            
+             xlab = "Giorni presenti in un Anno")
+
+```
+
+
+##### Modelli ARIMA
+
+Per poter costruire ed in seguito individuare il miglior modello ARIMA si è seguita la procedura Box-Jenkins.
+
+La prima fase di questa procedura riguarda l'analisi preliminare nella quale si verifica la stagionalità della serie, mediante l'ausilio dell'analisi grafica dei plot ACF (Autocorrelation) e PACF (Partial autocorrelation function).
+Analizzando i seguenti grafici si può notare come vi sia effettivamente stagionalità giornaliera, essa si può denotare dai picchi presenti in maniera costante nel correlogramma ACF.
+
+```{r Studio Stagionalità Giornaliera}
+y <- as.vector(y_daily)
+
+ggarrange(ggAcf(y,
+                lag.max = 72,        
+                main = ""),
+          ggPacf(y,
+                 lag.max = 72,       
+                 main = ""),
+          labels = c("ACF", "PACF"),
+          nrow = 2, ncol= 1)
+```
+
+
+
+Come individuato precedentemente la serie storica studiata non è stazionaria in varianza, si è deciso quindi di differenziare i valori ogni 24 ore. Vi è inoltre necessario applicare una seconda differenziazione per far si che la serie storica per limitare il trend.
+
+```{r Differenze}
+dy <- diff(y_daily,
+           lag = 24)    %>%
+  diff(differences = 1) %>%
+  diff(differences = 1)
+
+
+```
+
+Successivamente si è costruito il training set e il validation set per poter addestrare e valutare i vari modelli stagionali ARIMA al fine di trovare il modello migliore.
+La suddivisione è avvenuta costituendo con il 90% dei dati disponibili il training set (primi 658 giorni del dataset), mentre il validation set è stato composto dal rimanente 10%(ultimi 72 giorni). Ciò è stato scelto per via dell'esigua disponibilità di dati del dataset iniziale (730 giorni), difatti costruire un modello ARIMA solido con solamente 2 anni di serie storica non è semplice, quindi si è optato per un corposo tarining set a discapito del val set.
+Inoltre il dataset prima di essere splittato è stato standardizzato per poter agevolare l'apprendimento dei modelli, riducendo notevolmente il tempo computazionale di learning.
+
+```{r Split del Dataset}
+tt <- ts(scale(data$VALORE),start=1,frequency=24)
+y_train <- ts(tt[1:15768,],frequency=24, start=1) #90%
+y_test <- ts(tt[15769:17518],frequency=24, start=658) #10%
+n_test = length(y_test)
+```
+
+
+```{r Plot Split del Dataset}
+rbind(data.frame(Periodo=index(y_train), Valore=coredata(y_train), use="train"),
+      data.frame(Periodo=index(y_test), Valore=coredata(y_test), use="validation")) %>%
+  ggplot(aes(x=Periodo, y=Valore)) +
+  geom_line(aes(colour = use)) +
+  stat_smooth(method = "lm", se = T, col="blue", level=0.99)
+```
+
+Si passa al secondo punto del metodo Box-Jenkins, Ovvero l'identificazione del modello mediante l'individuazione degli ordine p,d,q del modello Arima non stagionale e i valori P,D,Q del modello stagionale ARIMA. Per far ciò si visionano i grafici di Autocorrelazione (ACF) e di Autocorrelazione parziale (PACF). 
+
+```{r ACF/PACF plot}
+ggarrange(ggAcf(dy,
+                lag.max = 72,        
+                main = ""),
+          ggPacf(dy,
+                 lag.max = 72,       
+                 main = ""),
+          labels = c("ACF", "PACF"),
+          nrow = 2, ncol= 1)
+```
+
+Visionando i grafici si è deciso di iniziare con un modello SARIMA(3,0,0)(0,1,0)
+
+## Arima model 1
+```{r Primo modello SARIMA (3,0,0)(0,1,0)}
+##ARIMA 1
+arima1 <- Arima(y_train,c(3,0,0), list(order=c(0,1,0),
+                                     lambda="auto"), 
+              include.constant = TRUE )      
+
+summary(arima1)
+```
+
+Il primo modello ARIMA ha riportato un mae relativa al training set pari a 0.0534 ed un AIC di -32054.17,
+
+
+```{r}
+ggAcf(arima1$residuals, lag.max = 72)
+
+ggPacf(arima1$residuals, lag.max = 72)
+
+checkresiduals(arima1)
+```
+```{r}
+autoplot(y_train) +
+  autolayer(pred1,series="Previsione", alpha=0.7) +
+  autolayer(y_test, series="Valori veri", alpha=0.6) +
+  xlab("Time") +
+  ylab("Valore")
+```
+
+
+
+```{r}
+pred1 <- forecast(arima1, h=n_test)
+
+pred_arima1 <- ts(pred1$mean, start=658, frequency = 24)
+
+
+pred1 %>% autoplot()
+
+
+```
+```{r MAE Arima1}
+mae_arima1 <- mean(abs(pred_arima1-y_test))
+mae_arima1
+```
+
+Il Modello Arima (3,0,0)(0,1,0) ha prodotto una Mean Absolute Error relativa al test set pari a 0.4699 con una MAE di 0.0533 relativa al training set.
+
+
+
+## Arima model 2
+
+Partndo dalle informazioni fornite dal primo modello Arima si è deciso di costruire come secondo modello: ARIMA(3,0,0)(0,1,2)
+
+```{r Secondo modello SARIMA (3,0,0)(0,1,2)}
+##ARIMA 2
+arima2 <- Arima(y_train,c(3,0,0), list(order=c(0,1,2),
+                                     lambda="auto"), 
+              include.constant = TRUE )      
+
+summary(arima2)
+```
+
+
+
+```{r}
+ggAcf(arima2$residuals, lag.max = 72)
+
+ggPacf(arima2$residuals, lag.max = 72)
+
+checkresiduals(arima2)
+```
+
+
+
+```{r}
+pred2 <- forecast(arima2, h=n_test)
+
+pred_arima2 <- ts(pred2$mean, start=658, frequency = 24)
+
+
+pred2 %>% autoplot()
+
+```
+
+```{r}
+mae_arima2 <- mean(abs(pred_arima2-y_test))
+mae_arima2
+```
+
+
+## Arima 3 
+
+
+```{r}
+AutoArima = auto.arima(y_train,seasonal=TRUE)
+AutoArima
+
+```
+
+
+```{r Terzo modello SARIMA (5,0,0)(2,1,0)}
+##ARIMA 3
+arima3 <- Arima(y_train,c(5,0,0), list(order=c(2,1,0),
+                                     lambda="auto"), 
+              include.constant = TRUE )      
+
+summary(arima3)
+```
+
+
+
+```{r}
+ggAcf(arima3$residuals, lag.max = 72)
+
+ggPacf(arima3$residuals, lag.max = 72)
+
+checkresiduals(arima3)
+```
+
+
+
+```{r}
+pred3 <- forecast(arima3, h=n_test)
+
+pred_arima3 <- ts(pred3$mean, start=658, frequency = 24)
+
+
+pred3 %>% autoplot()
+```
+
+
+
+```{r}
+mae_arima3 <- mean(abs(pred_arima3-y_test))
+mae_arima3
+```
+
+
+
+
+```{r Best ARIMA Model}
+
+ARIMA <- Arima(tt,c(5,0,0), list(order=c(2,1,0),
+                                 lambda="auto"), 
+               include.constant = TRUE )  
+pred_ARIMA <- forecast(ARIMA,h = 1464)
+pred_best_arima <- DMwR::unscale(as.numeric(pred_ARIMA$mean),
+                           tt)
+
+write.csv(pred_best_arima, file = "arima.csv")
+
+```
+
+
+
+
+
+#### Unobserved Component Model
+
+
+## Local Linear Trend con stagionalità Dummy
+```{r}
+
+## LLT con stagionalità dummy
+var_train <- var(y_train)
+
+
+ucm_mod1 <- SSModel(y_train ~ SSMtrend(2, list(NA,0)) +
+                      SSMseasonal(24, NA, "dummy"),
+                      H = NA)
+
+ucm_mod1$P1inf[] <- 0
+ucm_mod1$a1[1] <- mean(y_train, na.rm = TRUE)
+diag(ucm_mod1$P1) <- var_train
+
+
+ucm_fit1<- fitSSM(ucm_mod1, inits = log(c(var_train/10,
+                                          var_train/200,      
+                                          var_train/2,       
+                                          var_train/20)))     
+
+ucm_fit1$optim.out$convergence                                 
+ucm_fit1$model$Q  
+
+ucm_pred1 <- predict(ucm_fit1$model,
+                     n.ahead = n_test) 
+ucm_pred_1 <- ts(ucm_pred1,                             
+                start = 658,                           
+                frequency = 24)
+
+```
+```{r}
+autoplot(y_train) +
+  autolayer(ucm_pred1,series="Previsione", alpha=0.7) +
+  autolayer(y_test, series="Valori veri", alpha=0.6) +
+  xlab("Time") +
+  ylab("Valore")
+```
+
+```{r}
+autoplot(y_train,
+           main = "Predizione LLT con stagionalità dummy",                          
+           xlab = "Periodo",                      
+           ylab = "Valore",
+           col = "dodgerblue4")        
+    autolayer(y_test,                   
+              series = "Reale")                 
+    autolayer(ucm_pred_1,
+              series = "Previsione")
+```
+
+
+
+```{r}
+ucm_mae1 <- mean(abs(y_test - ucm_pred1))
+ucm_mae1
+```
+
+
+
+## Local Linear Trand con stagionalità Trigonometrica
+
+```{r}
+
+ucm_mod2 <- SSModel(y_train ~ SSMtrend(2, list(NA,0)) +
+                      SSMseasonal(24, NA, "trigonometric"),
+                    H = NA)
+
+updt_mod2 <- function(pars, model) {
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[3])
+  model$Q[4, 4, 1] <- exp(pars[4])
+  diag(model$Q[5 : 25, 5 : 25, 1]) <- exp(pars[5])
+  model$H[1, 1, 1] <- exp(pars[6])
+  model
+}
+
+ucm_fit2 <- fitSSM(ucm_mod2,
+               log(c(var_train/20, #10
+                     var_train/100, #100
+                     var_train/100, #75
+                     var_train/100, #20
+                     var_train/10,  #50
+                     var_train/10)), #5
+               updt_mod2
+)
+
+ucm_fit2$optim.out$convergence                                
+ucm_fit2$model$Q
+ucm_pred2 <- predict(ucm_fit2$model,
+                     n.ahead = n_test) 
+ucm_pred_2 <- ts(ucm_pred2,                             
+                start = 658,                          
+                frequency = 24)
+```
+
+
+
+```{r}
+autoplot(y_train,
+           main = "title",                          
+           xlab = "Periodo",                      
+           ylab = "Valore (in Milioni)",
+           col = "#0077b6")        
+    autolayer(y_test,                   
+              series = "Reale")                 
+    autolayer(ucm_pred_2,
+              series = "Previsione")
+```
+
+
+
+```{r}
+
+ucm_mae2 <- mean(abs(y_test - ucm_pred_2))
+ucm_mae2
+```
+
+## Local Linear Trend con Stagionalità Dummy e Ciclo Annuale
+
+```{r}
+var_train <- var(y_train)
+ucm_mod3 <- SSModel(y_train ~ SSMtrend(1, list(NA,0)) +
+                      SSMseasonal(24, NA, "trigonometric", harmonics=1:10)+
+                      SSMcycle(365*24),
+                    H = NA)
+
+ucm_mod3$P1inf <- ucm_mod3$P1inf * 0
+ucm_mod3$a1[1] <- mean(y_train, na.rm = TRUE)
+diag(ucm_mod3$P1) <- var_train
+
+init <- numeric(5)
+init[1] <- 0
+init[2] <- log(var_train/10) 
+init[3] <- log(var_train/100)
+init[4] <- log(var_train/100)
+init[5] <- log(var_train/10)
+
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    model$Q[3, 3, 1] <- exp(pars[3])
+    model$Q[4, 4, 1] <- exp(pars[4])
+    diag(model$Q[5:20, 5:20, 1]) <- exp(pars[4])
+    model$H[1, 1, 1] <- exp(pars[5])
+    model
+}
+ucm_fit3 <- fitSSM(ucm_mod3, init, update_fun)
+
+
+ucm_pred3 <- predict(ucm_fit3$model,
+                     n.ahead = n_test) #-- Numerosità Validation (3504)
+ucm_pred_3 <- ts(ucm_pred3,                             #-- Dataset Previsione
+                start = 658,                          
+                frequency = 24)
+```
+
+```{r}
+autoplot(y_train,
+           main = "title",                          
+           xlab = "Periodo",                      
+           ylab = "Valore (in Milioni)",
+           col = "#0077b6")        
+    autolayer(y_test,                   
+              series = "Reale")                 
+    autolayer(ucm_pred_3,
+              series = "Previsione")
+
+```
+
+```{r}
+
+ucm_mae3 <- mean(abs(y_test - ucm_pred3))
+ucm_mae3
+```
+
+
+
+
+
+
+
+```{r}
+
+UCM <- SSModel(y_train ~ SSMtrend(1, list(NA,0)) +
+                      SSMseasonal(24, NA, "dummy")+
+                      SSMcycle(365*24),
+                    H = NA)
+
+
+
+UCM_fit <- fitSSM(ucm_mod3,
+                   log(c(var_train/20, #10
+                         var_train/100, #100
+                         var_train/100, #75
+                         var_train/100, #20
+                         var_train/10,  #50
+                         var_train/10)), #5
+)
+
+UCM_fit$optim.out$convergence                                  
+UCM_fit$model$Q
+
+UCM_pred <- predict(UCM_fit$model,
+                     n.ahead = 1464 ) 
+UCM_pred <- DMwR::unscale(as.numeric(UCM_pred), 
+                         tt)
+
+
+write.csv(UCM_pred, file = "ucm.csv")
+```
+
